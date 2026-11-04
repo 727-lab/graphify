@@ -1284,6 +1284,131 @@ def _kotlin_collect_type_refs(node, source: bytes, generic: bool, out: list[tupl
             if c.is_named:
                 _kotlin_collect_type_refs(c, source, generic, out, skip)
 
+def _kotlin_declared_type_name(type_node, source: bytes) -> str | None:
+    """Base type name of a declared Kotlin type: ``Foo``, ``Foo?``, ``Foo<T>`` all give ``Foo``."""
+    node = type_node
+    while node is not None and node.type in ("nullable_type", "parenthesized_type", "type_reference"):
+        node = next((c for c in node.children if c.is_named), None)
+    if node is None or node.type != "user_type":
+        return None
+    return _kotlin_user_type_name(node, source)
+
+
+def _kotlin_constructor_init_type(declaration_node, source: bytes) -> str | None:
+    """Type of ``val x = Foo(...)``: a capitalised bare constructor call names the type."""
+    seen_eq = False
+    for c in declaration_node.children:
+        if c.type == "=":
+            seen_eq = True
+            continue
+        if seen_eq:
+            if (c.type == "call_expression" and c.children
+                    and c.children[0].type in ("simple_identifier", "identifier")):
+                name = _read_text(c.children[0], source)
+                return name if name[:1].isupper() else None
+            return None
+    return None
+
+
+def _kotlin_property_name(property_node, source: bytes) -> str | None:
+    """Declared name of a Kotlin ``property_declaration`` (``val name: T`` -> ``name``)."""
+    for c in property_node.children:
+        if c.type == "variable_declaration":
+            for sub in c.children:
+                if sub.type in ("simple_identifier", "identifier"):
+                    return _read_text(sub, source)
+    return None
+
+
+def _kotlin_method_receiver_types(
+    method_node,
+    source: bytes,
+    field_types: dict[str, str],
+) -> dict[str, str]:
+    """Build the receiver type table visible to one Kotlin function.
+
+    The Kotlin twin of ``_java_method_receiver_types``: class fields are the base
+    scope, parameters shadow them, typed locals (``val x: T`` or ``val x = T()``)
+    shadow both. A name bound to two different types is dropped rather than
+    guessed, because raw calls keep no lexical scope. Lambda parameters are
+    untyped in source and are not bound.
+    """
+    method_types: dict[str, str] = {}
+    ambiguous: set[str] = set()
+
+    def bind(name: str | None, type_name: str | None) -> None:
+        if not name or not type_name or name in ambiguous:
+            return
+        previous = method_types.get(name)
+        if previous is not None and previous != type_name:
+            method_types.pop(name, None)
+            ambiguous.add(name)
+        else:
+            method_types[name] = type_name
+
+    for c in method_node.children:
+        if c.type != "function_value_parameters":
+            continue
+        for p in c.children:
+            if p.type != "parameter":
+                continue
+            name = next(
+                (_read_text(s, source) for s in p.children if s.type in ("simple_identifier", "identifier")),
+                None,
+            )
+            type_node = next(
+                (s for s in p.children
+                 if s.type in ("user_type", "nullable_type", "type_reference", "parenthesized_type")),
+                None,
+            )
+            bind(name, _kotlin_declared_type_name(type_node, source))
+
+    body = next((c for c in method_node.children if c.type == "function_body"), None)
+    stack = list(body.children) if body is not None else []
+    while stack:
+        node = stack.pop()
+        if node.type in (
+            "class_declaration", "object_declaration", "function_declaration",
+            "lambda_literal", "anonymous_function",
+        ):
+            continue
+        if node.type == "property_declaration":
+            name = _kotlin_property_name(node, source)
+            type_node = _kotlin_property_type_node(node)
+            type_name = (
+                _kotlin_declared_type_name(type_node, source) if type_node is not None
+                else _kotlin_constructor_init_type(node, source)
+            )
+            if name and type_name:
+                if field_types.get(name) not in (None, type_name):
+                    method_types.pop(name, None)
+                    ambiguous.add(name)
+                else:
+                    bind(name, type_name)
+        stack.extend(node.children)
+
+    table = dict(field_types)
+    table.update(method_types)
+    for name in ambiguous:
+        table.pop(name, None)
+    return table
+
+
+def _kotlin_this_field_receiver(nav, source: bytes) -> str | None:
+    """``this.field.method`` -> ``field``; any other navigation shape -> None."""
+    named = [c for c in nav.children if c.is_named]
+    if len(named) != 2 or named[1].type not in ("simple_identifier", "identifier"):
+        return None
+    head = named[0]
+    if head.type != "navigation_expression":
+        return None
+    inner = [c for c in head.children if c.is_named]
+    if (len(inner) != 2 or inner[0].type != "this_expression"
+            or inner[1].type not in ("simple_identifier", "identifier")):
+        return None
+    return _read_text(inner[1], source)
+
+
 def _kotlin_property_type_node(property_node):
     """Find the user_type node within a Kotlin property_declaration."""
     for c in property_node.children:
@@ -6538,6 +6663,13 @@ def _extract_generic(
     java_field_names: dict[str, set[str]] = {}
     java_return_types: dict[str, str] = {}
     java_method_scopes: dict[int, tuple[object, str]] = {}
+    # Kotlin receiver typing mirrors Java: constructor `val`/`var` parameters and
+    # class properties are the shared base scope, function parameters and typed
+    # locals belong to their declaring function. Without this table a call through
+    # an injected dependency (`repo.save()`) had no receiver type and the shared
+    # cross-file pass dropped it as an unresolvable member call.
+    kotlin_field_types: dict[str, dict[str, str]] = {}
+    kotlin_method_scopes: dict[int, tuple[object, str]] = {}
     # C# receiver typing is method-scoped too (#2299): class fields/properties
     # are shared, parameters and locals belong only to their declaring method —
     # the old file-wide table let one method's untypable rebinding poison a
@@ -7119,6 +7251,14 @@ def _extract_generic(
                                             break
                                     if ptype is not None:
                                         cp_line = cp.start_point[0] + 1
+                                        _cp_name = next(
+                                            (_read_text(sub, source) for sub in cp.children
+                                             if sub.type in ("simple_identifier", "identifier")),
+                                            None,
+                                        )
+                                        _cp_type = _kotlin_declared_type_name(ptype, source)
+                                        if _cp_name and _cp_type:
+                                            kotlin_field_types.setdefault(class_nid, {})[_cp_name] = _cp_type
                                         refs: list[tuple[str, str]] = []
                                         _kotlin_collect_type_refs(ptype, source, False, refs)
                                         for ref_name, role in refs:
@@ -7932,6 +8072,13 @@ def _extract_generic(
                 # _safe_extract dropped the whole file.
                 line = node.start_point[0] + 1
                 type_node = _kotlin_property_type_node(node)
+                _prop_name = _kotlin_property_name(node, source)
+                _prop_type = (
+                    _kotlin_declared_type_name(type_node, source) if type_node is not None
+                    else _kotlin_constructor_init_type(node, source)
+                )
+                if _prop_name and _prop_type:
+                    kotlin_field_types.setdefault(parent_class_nid, {})[_prop_name] = _prop_type
                 if type_node is not None:
                     refs: list[tuple[str, str]] = []
                     _kotlin_collect_type_refs(type_node, source, False, refs)
@@ -8759,6 +8906,8 @@ def _extract_generic(
                     java_method_scopes[id(body)] = (node, parent_class_nid)
                 if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                     csharp_method_scopes[id(body)] = (node, parent_class_nid)
+                if config.ts_module == "tree_sitter_kotlin" and parent_class_nid:
+                    kotlin_method_scopes[id(body)] = (node, parent_class_nid)
                 function_bodies.append((func_nid, body))
                 if config.ts_module in (
                     "tree_sitter_javascript", "tree_sitter_typescript"
@@ -9319,6 +9468,14 @@ def _extract_generic(
         )
         for body_id, (method_node, class_nid) in csharp_method_scopes.items()
     }
+    kotlin_receiver_types = {
+        body_id: _kotlin_method_receiver_types(
+            method_node,
+            source,
+            _fields_up_chain(kotlin_field_types, class_nid),
+        )
+        for body_id, (method_node, class_nid) in kotlin_method_scopes.items()
+    }
 
     def _emit_indirect_by_name(ident_name: str, loc_node, scope_nid: str,
                                context: str) -> None:
@@ -9711,6 +9868,19 @@ def _extract_generic(
                             and segments[0][:1].isupper()
                         ):
                             kotlin_object_receiver = segments[0]
+                        # `repo.save()` / `repo?.save()`: a member call on a
+                        # value. The receiver is recorded so the Kotlin
+                        # receiver-typed resolver can bind it through the
+                        # function's type table; the in-file bare-name lookup
+                        # below is unchanged (a lowercase receiver never trips
+                        # the capitalized-receiver deferral).
+                        elif segments is not None and len(segments) == 2:
+                            member_receiver = segments[0]
+                        elif segments is None:
+                            # `this.field.method()`: the field is the receiver.
+                            _kt_this_field = _kotlin_this_field_receiver(first, source)
+                            if _kt_this_field:
+                                member_receiver = _kt_this_field
             elif config.ts_module == "tree_sitter_scala":
                 # Scala: first child
                 first = node.children[0] if node.children else None
@@ -10571,6 +10741,22 @@ def _extract_generic(
                         if kotlin_object_receiver:
                             rc_entry["lang"] = "kotlin"
                             rc_entry["kotlin_object_receiver"] = kotlin_object_receiver
+                        # Kotlin receiver-typed member call (`repo.save()`): the
+                        # lang tag + flag let _resolve_kotlin_receiver_member_calls
+                        # claim it; the type comes from the function's table when
+                        # the receiver is a parameter, local or field of this
+                        # class, otherwise the resolver reads inherited fields.
+                        if (
+                            config.ts_module == "tree_sitter_kotlin"
+                            and is_member_call and member_receiver
+                            and not kotlin_object_receiver and not kotlin_qualified_prefix
+                        ):
+                            rc_entry["lang"] = "kotlin"
+                            rc_entry["kotlin_member_receiver"] = True
+                            if isinstance(receiver_types, dict):
+                                _kt_type = receiver_types.get(member_receiver)
+                                if _kt_type:
+                                    rc_entry["receiver_type"] = _kt_type
                         raw_calls.append(rc_entry)
 
             # Indirect dispatch: a function passed BY NAME as a call argument
@@ -10925,7 +11111,7 @@ def _extract_generic(
     # Body ids are unique (one language per file), so the Java (flat) and C#
     # (scoped, #2472) per-method receiver tables merge without collision — the
     # stamp site branches on language to read the matching shape.
-    receiver_types_by_body = {**java_receiver_types, **csharp_receiver_types}
+    receiver_types_by_body = {**java_receiver_types, **csharp_receiver_types, **kotlin_receiver_types}
     for caller_nid, body_node in function_bodies:
         walk_calls(
             body_node,
@@ -11060,6 +11246,7 @@ def _extract_generic(
          "source_file": _n.get("source_file"), "fields": dict(_tbl)}
         for _lang, _tables in (
             ("java", java_field_types),
+            ("kotlin", kotlin_field_types),
             ("csharp", csharp_field_types),
             ("csharp_returns", csharp_method_returns),
         )

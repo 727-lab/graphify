@@ -27,6 +27,7 @@ from .resolver_registry import (
 )
 from .ruby_resolution import resolve_ruby_member_calls
 from .csharp_dispatch import resolve_csharp_interface_dispatch
+from .jvm_dispatch import resolve_jvm_interface_dispatch
 from .go_dispatch import resolve_go_interface_dispatch
 from .swift_dispatch import resolve_swift_protocol_dispatch
 from .pascal_resolution import resolve_pascal_inherited_calls
@@ -8234,6 +8235,162 @@ def _resolve_kotlin_member_calls(
         })
 
 
+def _resolve_kotlin_receiver_member_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve Kotlin member calls on a typed value receiver across files.
+
+    ``repo.save()`` where ``repo`` is a constructor parameter, a property, a
+    function parameter or a typed local: the engine stamps ``receiver_type``
+    from the function's table (the Kotlin twin of ``_resolve_java_member_calls``).
+    A receiver that is a field inherited from a supertype in another file is
+    typed here from the exported field tables (#3151 shape, lang ``kotlin``).
+
+    Guards, in the same spirit as the other receiver-typed resolvers:
+    * the type must be declared exactly once among JVM nodes, or be the one of
+      the matching candidates the caller's file imports or shares a directory
+      with — otherwise nothing is emitted;
+    * the method must be declared exactly once on the type or, walking
+      ``inherits``/``implements`` within the JVM family, on its supertypes;
+    * a type declared nowhere here is parked for the merge (#3152).
+
+    Edges are INFERRED 0.85: the receiver's type comes from a declaration, not
+    from the call site naming the type.
+    """
+    def key(label: str) -> str:
+        return str(label).strip().removeprefix(".").removesuffix("()")
+
+    raw = [
+        rc
+        for result in per_file
+        for rc in result.get("raw_calls", [])
+        if rc.get("lang") == "kotlin" and rc.get("kotlin_member_receiver")
+        and rc.get("callee") and rc.get("caller_nid") and rc.get("receiver")
+    ]
+    if not raw:
+        return
+
+    node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
+    contained = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
+    type_def_nids: dict[str, list[str]] = {}
+    file_nids: dict[str, str] = {}
+    for n in all_nodes:
+        sf = str(n.get("source_file") or "")
+        if not sf or _lang_family(sf) != "jvm":
+            continue
+        if n.get("_callable_class") and n.get("id") in contained:
+            type_def_nids.setdefault(key(n.get("label", "")), []).append(n["id"])
+        elif not n.get("_callable") and str(n.get("label", "")).endswith(os.path.basename(sf)):
+            file_nids.setdefault(sf, n["id"])
+
+    method_index: dict[tuple[str, str], set[str]] = {}
+    enclosing_type: dict[str, str] = {}
+    supertypes: dict[str, list[str]] = {}
+    imported_by_file: dict[str, set[str]] = {}
+    for e in all_edges:
+        rel = e.get("relation")
+        if rel == "method":
+            m = node_by_id.get(e.get("target"))
+            if m is None:
+                continue
+            enclosing_type.setdefault(e["target"], e["source"])
+            method_index.setdefault((e["source"], key(m.get("label", ""))), set()).add(e["target"])
+        elif rel in ("inherits", "implements"):
+            supertypes.setdefault(e["source"], []).append(e["target"])
+        elif rel == "imports":
+            imported_by_file.setdefault(e["source"], set()).add(e["target"])
+    class_fields = _bind_member_field_tables(per_file, all_nodes, lang="kotlin")
+    existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
+
+    def _inherited_field_type(class_nid: str | None, field: str) -> str | None:
+        seen: set[str] = set()
+        queue = [class_nid] if class_nid else []
+        while queue:
+            cls = queue.pop(0)
+            if not cls or cls in seen:
+                continue
+            seen.add(cls)
+            hit = class_fields.get(cls, {}).get(field)
+            if hit:
+                return hit
+            queue.extend(supertypes.get(cls, []))
+        return None
+
+    def _type_named(name: str, rc: dict) -> tuple[str | None, bool]:
+        """(type nid, declared_somewhere). Ambiguity is narrowed by the caller's file:
+        its own declaration, then its imports, then its directory; a remaining tie binds nothing."""
+        defs = type_def_nids.get(key(name), [])
+        if not defs:
+            return None, False
+        if len(defs) == 1:
+            return defs[0], True
+        sf = str(rc.get("source_file", ""))
+        here = [d for d in defs if node_by_id[d].get("source_file") == sf]
+        if len(here) == 1:
+            return here[0], True
+        imported = imported_by_file.get(file_nids.get(sf, ""), set())
+        via_import = [d for d in defs if d in imported]
+        if len(via_import) == 1:
+            return via_import[0], True
+        same_dir = [
+            d for d in defs
+            if os.path.dirname(str(node_by_id[d].get("source_file", ""))) == os.path.dirname(sf)
+        ]
+        if len(same_dir) == 1:
+            return same_dir[0], True
+        return None, True
+
+    def _method_on_type_or_bases(type_nid: str, callee_key: str) -> str | None:
+        hits: set[str] = set()
+        seen: set[str] = set()
+        frontier = [type_nid]
+        while frontier:
+            nid = frontier.pop()
+            if nid in seen:
+                continue
+            seen.add(nid)
+            declared = method_index.get((nid, callee_key))
+            if declared:
+                hits |= declared
+                continue
+            for base in supertypes.get(nid, []):
+                if _lang_family(node_by_id.get(base, {}).get("source_file")) != "jvm":
+                    return None
+                frontier.append(base)
+        return next(iter(hits)) if len(hits) == 1 else None
+
+    for rc in raw:
+        receiver, callee, caller = rc["receiver"], rc["callee"], rc["caller_nid"]
+        type_name = rc.get("receiver_type")
+        if not type_name:
+            owner = enclosing_type.get(caller, caller)
+            type_name = _inherited_field_type(owner, receiver)
+        if not type_name or type_name in _LANGUAGE_BUILTIN_GLOBALS:
+            continue
+        type_nid, declared = _type_named(type_name, rc)
+        if type_nid is None:
+            if not declared:
+                _park_unresolved_member_call(node_by_id.get(caller), callee, type_name, "kotlin", rc)
+            continue
+        method_nid = _method_on_type_or_bases(type_nid, key(callee))
+        if not method_nid or method_nid == caller or (caller, method_nid) in existing_pairs:
+            continue
+        existing_pairs.add((caller, method_nid))
+        all_edges.append({
+            "source": caller,
+            "target": method_nid,
+            "relation": "calls",
+            "context": "call",
+            "confidence": "INFERRED",
+            "confidence_score": 0.85,
+            "source_file": rc.get("source_file", ""),
+            "source_location": rc.get("source_location"),
+            "weight": 1.0,
+        })
+
+
 # Kotlin import-target resolution runs EARLY (directly in extract(), before the
 # shared call pass builds its import-evidence index) — registering it in the
 # tail registry would rewrite the targets after promotion already read them.
@@ -8363,6 +8520,25 @@ register_language_resolver(
 register_language_resolver(
     LanguageResolver(
         "kotlin_member_calls", frozenset({".kt", ".kts"}), _resolve_kotlin_member_calls
+    )
+)
+# Kotlin receiver-typed member calls: `repo.save()` on a constructor-injected
+# or locally typed value, bound through the function's type table (the Kotlin
+# twin of java_member_calls). Runs after kotlin_member_calls so the explicit
+# `Object.method()` shape keeps its EXTRACTED binding.
+register_language_resolver(
+    LanguageResolver(
+        "kotlin_receiver_member_calls", frozenset({".kt", ".kts"}),
+        _resolve_kotlin_receiver_member_calls,
+    )
+)
+# JVM member-level interface dispatch: the Kotlin/Java twin of the C# pass
+# below. A call through an injected `OrdersInfoHolder` lands on the interface's
+# method; the implementation sits unreachable from it until this links them.
+register_language_resolver(
+    LanguageResolver(
+        "jvm_interface_dispatch", frozenset({".kt", ".kts", ".java"}),
+        resolve_jvm_interface_dispatch,
     )
 )
 # Go receiver-typed member-call resolution: `g.Greet()` where the method is declared in
