@@ -1306,9 +1306,23 @@ def _kotlin_constructor_init_type(declaration_node, source: bytes) -> str | None
             if (c.type == "call_expression" and c.children
                     and c.children[0].type in ("simple_identifier", "identifier")):
                 name = _read_text(c.children[0], source)
+                if name in _KOTLIN_TYPED_FACTORIES:
+                    return _kotlin_single_type_argument(c, source)
                 return name if name[:1].isupper() else None
             return None
     return None
+
+
+_KOTLIN_TYPED_FACTORIES = frozenset({"mockk", "relaxedMockk", "spyk", "mock", "spy"})
+
+
+def _kotlin_single_type_argument(call_node, source: bytes) -> str | None:
+    args = next((c for c in call_node.children if c.type == "type_arguments"), None)
+    projections = [c for c in args.children if c.type == "type_projection"] if args is not None else []
+    if len(projections) != 1:
+        return None
+    inner = next((c for c in projections[0].children if c.is_named), None)
+    return _kotlin_declared_type_name(inner, source)
 
 
 def _kotlin_property_name(property_node, source: bytes) -> str | None:
@@ -1415,11 +1429,15 @@ _KOTLIN_DI_WRAPPERS = frozenset({"Lazy", "Provider", "StateFlow", "MutableStateF
 _KOTLIN_SUSPEND_LAMBDA = re.compile(rb"\bsuspend(\s*\{)")
 _KOTLIN_SOFT_KEYWORD_PARAM = re.compile(rb"\boverride(?=\s*(?:,|->|\)|\?\.|\.|\?:))")
 _KOTLIN_TRAILING_TYPE_COMMA = re.compile(rb",(\s*>)")
+_KOTLIN_WHEN_GUARD = re.compile(rb"(\bis\s+[A-Za-z_][\w.<>?, ]*?)([ \t]+if[ \t]+[^\n]*?)([ \t]*->)")
+_KOTLIN_ANNOTATED_FUNCTION_TYPE = re.compile(rb"@Composable(?:\(\))?(?=[ \t]+\()")
 
 
 def _kotlin_repair_grammar_gaps(source: bytes) -> bytes:
     repaired = _KOTLIN_SUSPEND_LAMBDA.sub(lambda m: b"run    " + m.group(1), source)
     repaired = _KOTLIN_TRAILING_TYPE_COMMA.sub(lambda m: b" " + m.group(1), repaired)
+    repaired = _KOTLIN_WHEN_GUARD.sub(lambda m: m.group(1) + b" " * len(m.group(2)) + m.group(3), repaired)
+    repaired = _KOTLIN_ANNOTATED_FUNCTION_TYPE.sub(lambda m: b" " * len(m.group(0)), repaired)
     return _KOTLIN_SOFT_KEYWORD_PARAM.sub(b"overrid_", repaired)
 
 
@@ -10018,6 +10036,32 @@ def _extract_generic(
                 ):
                     _ruby_bare_self_send = True
 
+        if (
+            config.ts_module == "tree_sitter_kotlin"
+            and node.type == "navigation_expression"
+            and node.parent is not None
+            and node.parent.type != "navigation_expression"
+            and not (node.parent.type == "call_expression" and node.parent.children
+                     and node.parent.children[0] == node)
+        ):
+            _kt_read = _kotlin_receiver_chain(node, source)
+            if _kt_read and _kt_read[0] == "field" and _kt_read[2] is not None:
+                _kt_read_typed = _kotlin_type_chain_leaf(
+                    _kt_read, receiver_types if isinstance(receiver_types, dict) else {},
+                )
+                if _kt_read_typed:
+                    raw_calls.append({
+                        "caller_nid": caller_nid,
+                        "callee": _kt_read[1],
+                        "is_member_call": True,
+                        "source_file": str_path,
+                        "source_location": f"L{node.start_point[0] + 1}",
+                        "receiver": None,
+                        "lang": "kotlin",
+                        "kotlin_property_read": True,
+                        "kotlin_receiver_chain": _kt_read_typed,
+                    })
+
         if node.type in config.call_types or _ruby_bare_self_send:
             # JS/TS dynamic imports: await import('./foo.js')
             if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
@@ -10740,7 +10784,19 @@ def _extract_generic(
                     and member_receiver != "this"
                     and member_receiver in type_table
                 )
-                if _python_defer or _java_defer or _csharp_defer or _js_member_defer or _cpp_member_defer or (_builtin_member_call and not php_builtin_self_call) or _lua_member_defer or is_scoped_call or (
+                _kotlin_member_defer = (
+                    config.ts_module == "tree_sitter_kotlin"
+                    and is_member_call
+                    and (
+                        kotlin_receiver_chain is not None
+                        or (
+                            member_receiver is not None
+                            and isinstance(receiver_types, dict)
+                            and member_receiver in receiver_types
+                        )
+                    )
+                )
+                if _python_defer or _java_defer or _csharp_defer or _js_member_defer or _cpp_member_defer or _kotlin_member_defer or (_builtin_member_call and not php_builtin_self_call) or _lua_member_defer or is_scoped_call or (
                     is_member_call
                     and member_receiver
                     and (

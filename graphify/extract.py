@@ -8536,6 +8536,8 @@ def _resolve_kotlin_receiver_member_calls(
                         "source_location": rc.get("source_location"),
                         "weight": 1.0,
                     })
+            if rc.get("kotlin_property_read"):
+                continue
         else:
             type_name = rc.get("receiver_type") or _inherited_field_type(
                 enclosing_type.get(caller, caller), rc["receiver"]

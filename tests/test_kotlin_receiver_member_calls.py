@@ -335,6 +335,22 @@ def test_same_named_extension_flow_properties_bind_through_the_readers_import(tm
     assert ("Service:.subscribe()", "BaseExt:baseState") not in edges
 
 
+def test_flow_passed_as_an_argument_or_assigned_is_a_read(tmp_path: Path) -> None:
+    edges = _edges(tmp_path, {
+        "core/Core.kt": "package core\n"
+                        "interface Core<S> {\n    val state: StateFlow<S>\n    val other: Flow<Int>\n}\n",
+        "app/Service.kt": "package app\nimport core.Core\n"
+                          "class Service(private val interactor: Core<String>) {\n"
+                          "    fun merged() = combine(interactor.state, interactor.other) { a, b -> a }\n"
+                          "    fun kept() { val s = interactor.state }\n"
+                          "    fun none() { val n = interactor.hashCode() }\n}\n",
+    })
+    assert ("Service:.merged()", "Core:.state") in edges
+    assert ("Service:.merged()", "Core:.other") in edges
+    assert ("Service:.kept()", "Core:.state") in edges
+    assert ("Service:.none()", "Core:.state") not in edges
+
+
 def test_flow_property_read_through_an_implementation_with_an_unknown_base(tmp_path: Path) -> None:
     edges = _edges(tmp_path, {
         "core/Core.kt": "package core\n"
@@ -416,6 +432,47 @@ def test_grammar_gaps_are_repaired_without_moving_lines(tmp_path: Path) -> None:
     called = {by_id[e["target"]]["label"] for e in r["edges"]
               if e["relation"] == "calls" and e["source"] == third[0]["id"]}
     assert ".save()" in called
+
+
+def test_mock_factories_type_the_field_in_tests(tmp_path: Path) -> None:
+    edges = _edges(tmp_path, {
+        "data/OrderRepo.kt": REPO_KT,
+        "app/CheckoutTest.kt": "package app\nimport data.OrderRepo\n"
+                               "class CheckoutTest {\n"
+                               "    private val repo = mockk<OrderRepo>(relaxed = true)\n"
+                               "    fun stubs() { coEvery { repo.load(any()) } returns \"x\" }\n"
+                               "    fun verifies() { repo.save(\"1\") }\n}\n",
+    })
+    assert ("CheckoutTest:.stubs()", "OrderRepo:.load()") in edges
+    assert ("CheckoutTest:.verifies()", "OrderRepo:.save()") in edges
+
+
+def test_typed_receiver_does_not_bind_to_a_same_named_method_of_this_file(tmp_path: Path) -> None:
+    edges = _edges(tmp_path, {
+        "data/OrderRepo.kt": REPO_KT,
+        "app/Facade.kt": "package app\nimport data.OrderRepo\n"
+                         "class Facade(private val dataSource: OrderRepo) {\n"
+                         "    fun load(id: String): String = dataSource.load(id)\n"
+                         "    fun other() = load(\"1\")\n}\n",
+    })
+    assert ("Facade:.load()", "OrderRepo:.load()") in edges
+    assert ("Facade:.load()", "Facade:.load()") not in edges
+    assert ("Facade:.other()", "Facade:.load()") in edges
+
+
+def test_when_guard_does_not_break_the_class(tmp_path: Path) -> None:
+    source = (
+        "package app\nimport data.OrderRepo\n"
+        "class Guarded(private val repo: OrderRepo) {\n"
+        "    fun pick(x: Any, flag: Boolean) = when (x) {\n"
+        "        is String if flag -> repo.load(x)\n"
+        "        else -> \"\"\n"
+        "    }\n"
+        "    fun after() {\n        repo.save(\"1\")\n    }\n}\n"
+    )
+    edges = _edges(tmp_path, {"data/OrderRepo.kt": REPO_KT, "app/Guarded.kt": source})
+    assert ("Guarded:.pick()", "OrderRepo:.load()") in edges
+    assert ("Guarded:.after()", "OrderRepo:.save()") in edges
 
 
 def test_type_parameter_receiver_takes_its_upper_bound(tmp_path: Path) -> None:
