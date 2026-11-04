@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +69,33 @@ def _format_location(data: dict) -> str:
     if source_location:
         return f"{source_file}:{source_location}"
     return str(source_file)
+
+
+def _member_owner(graph: nx.Graph, node_id: str) -> str | None:
+    if not isinstance(graph, nx.DiGraph):
+        return None
+    for source, _, data in graph.in_edges(node_id, data=True):
+        if data.get("relation") == "method":
+            return str(graph.nodes[source].get("label") or "") or None
+    return None
+
+
+def _source_line(root: Path | None, location: str) -> str | None:
+    file_part, _, line_part = location.rpartition(":")
+    digits = line_part.lstrip("L").split("-")[0]
+    if not file_part or not digits.isdigit():
+        return None
+    path = Path(file_part)
+    if not path.is_absolute() and root is not None:
+        path = root / path
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for number, text in enumerate(handle, 1):
+                if number == int(digits):
+                    return " ".join(text.split())[:140]
+    except OSError:
+        return None
+    return None
 
 
 def _bare_name(label: str) -> str:
@@ -434,6 +462,7 @@ def format_affected(
         lines.append("No affected nodes found.")
         return "\n".join(lines)
 
+    detail = os.environ.get("GRAPHIFY_AFFECTED_DETAIL") == "1"
     for hit in hits:
         data = graph.nodes[hit.node_id]
         if hit.via_location:
@@ -442,9 +471,16 @@ def format_affected(
             location = f"{hit.via_file or data.get('source_file') or '-'}:{hit.via_location}"
         else:
             location = _format_location(data)  # honest fallback: the node's own def line
-        lines.append(
-            f"- {_node_label(graph, hit.node_id)} [{hit.via_relation}] {location}"
-        )
+        label = _node_label(graph, hit.node_id)
+        suffix = ""
+        if detail:
+            owner = _member_owner(graph, hit.node_id)
+            if owner and label.startswith("."):
+                label = owner + label
+            snippet = _source_line(root, location) if hit.via_location else None
+            if snippet:
+                suffix = f"  | {snippet}"
+        lines.append(f"- {label} [{hit.via_relation}] {location}{suffix}")
     return "\n".join(lines)
 
 
