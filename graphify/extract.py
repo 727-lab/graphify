@@ -8272,7 +8272,7 @@ def _resolve_kotlin_receiver_member_calls(
     if not raw:
         return
 
-    node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
+    node_by_id: dict[str, dict] = {n["id"]: n for n in all_nodes}
     contained = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
     type_def_nids: dict[str, list[str]] = {}
     file_nids: dict[str, str] = {}
@@ -8292,7 +8292,7 @@ def _resolve_kotlin_receiver_member_calls(
     for e in all_edges:
         rel = e.get("relation")
         if rel == "method":
-            m = node_by_id.get(e.get("target"))
+            m = node_by_id.get(e["target"])
             if m is None:
                 continue
             enclosing_type.setdefault(e["target"], e["source"])
