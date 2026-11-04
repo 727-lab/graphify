@@ -1429,14 +1429,23 @@ _KOTLIN_DI_WRAPPERS = frozenset({"Lazy", "Provider", "StateFlow", "MutableStateF
 _KOTLIN_SUSPEND_LAMBDA = re.compile(rb"\bsuspend(\s*\{)")
 _KOTLIN_SOFT_KEYWORD_PARAM = re.compile(rb"\boverride(?=\s*(?:,|->|\)|\?\.|\.|\?:))")
 _KOTLIN_TRAILING_TYPE_COMMA = re.compile(rb",(\s*>)")
-_KOTLIN_WHEN_GUARD = re.compile(rb"(\bis\s+[A-Za-z_][\w.<>?, ]*?)([ \t]+if[ \t]+[^\n]*?)([ \t]*->)")
+_KOTLIN_WHEN_GUARD = re.compile(rb"(\bis\s+[A-Za-z_][\w.<>?, ]*?)([ \t]+if[ \t]+(?:[^\n]*\n){0,2}?[^\n]*?)([ \t]*->)")
+_KOTLIN_MULTI_DOLLAR_STRING = re.compile(rb'(?<![\w$"\\])\$+(?=")')
+_KOTLIN_PAREN_LAMBDA_START = re.compile(rb"\{(\s*)\(([\w.]+)\)(?!\s*(?:->|:|,))")
 _KOTLIN_ANNOTATED_FUNCTION_TYPE = re.compile(rb"@Composable(?:\(\))?(?=[ \t]+\()")
+
+
+def _blank_keep_lines(text: bytes) -> bytes:
+    return bytes(b if b == 0x0A else 0x20 for b in text)
 
 
 def _kotlin_repair_grammar_gaps(source: bytes) -> bytes:
     repaired = _KOTLIN_SUSPEND_LAMBDA.sub(lambda m: b"run    " + m.group(1), source)
     repaired = _KOTLIN_TRAILING_TYPE_COMMA.sub(lambda m: b" " + m.group(1), repaired)
-    repaired = _KOTLIN_WHEN_GUARD.sub(lambda m: m.group(1) + b" " * len(m.group(2)) + m.group(3), repaired)
+    repaired = _KOTLIN_WHEN_GUARD.sub(lambda m: m.group(1) + _blank_keep_lines(m.group(2)) + m.group(3), repaired)
+    repaired = _KOTLIN_MULTI_DOLLAR_STRING.sub(lambda m: b" " * len(m.group(0)), repaired)
+    repaired = _KOTLIN_PAREN_LAMBDA_START.sub(lambda m: b"{" + m.group(1) + b" " + m.group(2) + b" ", repaired)
+    repaired = repaired.replace(b"\x00", b" ")
     repaired = _KOTLIN_ANNOTATED_FUNCTION_TYPE.sub(lambda m: b" " * len(m.group(0)), repaired)
     return _KOTLIN_SOFT_KEYWORD_PARAM.sub(b"overrid_", repaired)
 

@@ -475,6 +475,32 @@ def test_when_guard_does_not_break_the_class(tmp_path: Path) -> None:
     assert ("Guarded:.after()", "OrderRepo:.save()") in edges
 
 
+def test_newer_syntax_and_odd_bytes_do_not_break_the_class(tmp_path: Path) -> None:
+    source = (
+        "package app\nimport data.OrderRepo\n"
+        "class Odd(private val repo: OrderRepo) {\n"
+        "    fun pick(x: Any, a: Boolean, b: Boolean) = when (x) {\n"
+        "        is String if a &&\n"
+        "            b -> repo.load(x)\n"
+        "        else -> \"\"\n"
+        "    }\n"
+        "    fun tag(ids: List<String>) = ids.map { id ->\n"
+        "        $\"{i:${id};\" + \"x\"\n"
+        "    }\n"
+        "    fun gate(ids: List<String>, on: Boolean) = ids.takeIf {\n"
+        "        (on) && it.isNotEmpty()\n"
+        "    }\n"
+        "    fun zero(t: Int) = when (t) {\n"
+        "        1 -> '\x00'\n"
+        "        else -> null\n"
+        "    }\n"
+        "    fun after() {\n        repo.save(\"1\")\n    }\n}\n"
+    )
+    edges = _edges(tmp_path, {"data/OrderRepo.kt": REPO_KT, "app/Odd.kt": source})
+    assert ("Odd:.pick()", "OrderRepo:.load()") in edges
+    assert ("Odd:.after()", "OrderRepo:.save()") in edges
+
+
 def test_type_parameter_receiver_takes_its_upper_bound(tmp_path: Path) -> None:
     edges = _edges(tmp_path, {
         "data/OrderRepo.kt": REPO_KT,
