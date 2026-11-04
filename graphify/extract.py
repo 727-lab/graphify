@@ -8235,6 +8235,30 @@ def _resolve_kotlin_member_calls(
         })
 
 
+_KOTLIN_SELF_RETURNING_SCOPE_FUNCTIONS = frozenset({"apply", "also", "takeIf", "takeUnless"})
+
+_KOTLIN_NO_EXTENSION_FALLBACK = frozenset({
+    "copy", "equals", "hashCode", "toString", "component1", "component2", "component3",
+    "component4", "component5", "map", "filter", "let", "run", "apply", "also", "with",
+    "first", "firstOrNull", "last", "lastOrNull", "orEmpty", "isNullOrEmpty", "isNotEmpty",
+    "isEmpty", "isNullOrBlank", "isNotBlank", "toList", "toSet", "toMap", "toMutableList",
+    "forEach", "forEachIndexed", "any", "all", "none", "find", "getOrNull", "getOrDefault",
+    "getOrElse", "plus", "minus", "take", "drop", "sorted", "sortedBy", "sortedByDescending",
+    "groupBy", "associate", "associateBy", "associateWith", "joinToString", "contains",
+    "count", "sum", "sumOf", "maxOf", "minOf", "maxByOrNull", "minByOrNull", "distinct",
+    "distinctBy", "flatMap", "mapNotNull", "mapIndexed", "filterNotNull", "filterIsInstance",
+    "filterNot", "zip", "collect", "collectLatest", "onEach", "onStart", "onCompletion",
+    "launchIn", "stateIn", "shareIn", "catch", "flowOn", "emit", "tryEmit", "update",
+    "compareAndSet", "get", "set", "invoke", "toInt", "toLong", "toDouble", "toFloat",
+    "toBoolean", "trim", "lowercase", "uppercase", "startsWith", "endsWith", "split",
+    "replace", "substring", "format", "takeWhile", "dropWhile", "partition", "fold",
+    "reduce", "indexOf", "chunked", "windowed", "asSequence", "toTypedArray", "awaitAll",
+    "launch", "async", "await", "cancel", "join", "withTimeout", "mapLatest",
+    "flatMapLatest", "combine", "distinctUntilChanged", "debounce", "ifEmpty", "ifBlank",
+    "coerceIn", "coerceAtLeast", "coerceAtMost", "roundToInt",
+})
+
+
 def _resolve_kotlin_receiver_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -8266,8 +8290,9 @@ def _resolve_kotlin_receiver_member_calls(
         rc
         for result in per_file
         for rc in result.get("raw_calls", [])
-        if rc.get("lang") == "kotlin" and rc.get("kotlin_member_receiver")
-        and rc.get("callee") and rc.get("caller_nid") and rc.get("receiver")
+        if rc.get("lang") == "kotlin" and rc.get("callee") and rc.get("caller_nid")
+        and (rc.get("kotlin_receiver_chain")
+             or (rc.get("kotlin_member_receiver") and rc.get("receiver")))
     ]
     if not raw:
         return
@@ -8361,20 +8386,172 @@ def _resolve_kotlin_receiver_member_calls(
                 frontier.append(base)
         return next(iter(hits)) if len(hits) == 1 else None
 
+    toplevel_functions: dict[str, list[str]] = {}
+    for n in all_nodes:
+        if (n.get("_callable") and not n.get("_callable_class")
+                and n["id"] in contained and n["id"] not in enclosing_type
+                and _lang_family(str(n.get("source_file") or "")) == "jvm"):
+            toplevel_functions.setdefault(key(n.get("label", "")), []).append(str(n["id"]))
+
+    def _source_of(nid: str) -> str:
+        return str(node_by_id.get(nid, {}).get("source_file", ""))
+
+    def _type_closure(type_nid: str) -> list[str]:
+        seen: list[str] = []
+        frontier = [type_nid]
+        while frontier:
+            nid = frontier.pop(0)
+            if nid in seen:
+                continue
+            seen.append(nid)
+            frontier.extend(supertypes.get(nid, []))
+        return seen
+
+    extension_flow_properties: dict[str, list[tuple[str, str | None, list[str]]]] = {}
+    for n in all_nodes:
+        md = n.get("metadata") or {}
+        receiver_name = md.get("kotlin_extension_receiver")
+        if md.get("kotlin_flow_property") and receiver_name:
+            receiver_nid, _ = _type_named(receiver_name, {"source_file": n.get("source_file", "")})
+            extension_flow_properties.setdefault(key(n.get("label", "")), []).append(
+                (n["id"], receiver_nid, list(md.get("kotlin_getter_reads") or []))
+            )
+
+    def _flow_property_on_type_or_bases(type_nid: str, name: str, reader_file: str = "") -> str | None:
+        closure = _type_closure(type_nid)
+        for nid in closure:
+            for member in method_index.get((nid, name), ()):
+                if (node_by_id.get(member, {}).get("metadata") or {}).get("kotlin_flow_property"):
+                    return member
+        matches = [
+            ext_nid for ext_nid, receiver_nid, _ in extension_flow_properties.get(name, [])
+            if receiver_nid in closure
+        ]
+        if len(matches) <= 1:
+            return matches[0] if matches else None
+        imported = imported_by_file.get(file_nids.get(reader_file, ""), set())
+        via_import = [
+            m for m in matches
+            if m in imported or file_nids.get(_source_of(m), "") in imported
+        ]
+        if len(via_import) == 1:
+            return via_import[0]
+        same_dir = [m for m in matches if os.path.dirname(_source_of(m)) == os.path.dirname(reader_file)]
+        return same_dir[0] if len(same_dir) == 1 else None
+
+    for ext_list in extension_flow_properties.values():
+        for ext_nid, receiver_nid, reads in ext_list:
+            if not receiver_nid:
+                continue
+            for read in reads:
+                target = _flow_property_on_type_or_bases(receiver_nid, read)
+                if target and target != ext_nid and (ext_nid, target) not in existing_pairs:
+                    existing_pairs.add((ext_nid, target))
+                    all_edges.append({
+                        "source": ext_nid,
+                        "target": target,
+                        "relation": "calls",
+                        "context": "property_read",
+                        "confidence": "INFERRED",
+                        "confidence_score": 0.85,
+                        "source_file": node_by_id[ext_nid].get("source_file", ""),
+                        "source_location": node_by_id[ext_nid].get("source_location"),
+                        "weight": 1.0,
+                    })
+
+    def _unwrap(type_name: str) -> tuple[str, str]:
+        base, _, inner = type_name.partition("<")
+        return base, inner.removesuffix(">")
+
+    def _chain_type(chain: list, caller: str, near: str, depth: int = 0) -> tuple[str | None, str]:
+        kind = chain[0] if chain and depth <= 16 else None
+        if kind == "type":
+            return chain[1], near
+        if kind == "this":
+            owner = enclosing_type.get(caller)
+            return (key(node_by_id[owner].get("label", "")), _source_of(owner)) if owner else (None, near)
+        if kind not in ("field", "call"):
+            return None, near
+        step = chain[1]
+        if chain[2] is None:
+            owner_nid = enclosing_type.get(caller)
+        else:
+            owner_name, owner_near = _chain_type(chain[2], caller, near, depth + 1)
+            if not owner_name:
+                return None, near
+            if "<" in owner_name:
+                wrapper, inner = _unwrap(owner_name)
+                unwraps = (
+                    (kind == "call" and step == "get" and wrapper in ("Lazy", "Provider"))
+                    or (kind == "field" and step == "value")
+                )
+                return (inner, owner_near) if unwraps else (None, near)
+            if kind == "call" and step in _KOTLIN_SELF_RETURNING_SCOPE_FUNCTIONS:
+                return owner_name, owner_near
+            owner_nid, _ = _type_named(owner_name, {"source_file": owner_near})
+        if not owner_nid:
+            return None, near
+        if kind == "field":
+            prop_nid = _flow_property_on_type_or_bases(owner_nid, key(step), _source_of(caller))
+            if prop_nid:
+                flow_reads.append((caller, prop_nid))
+            return _inherited_field_type(owner_nid, step), _source_of(owner_nid)
+        method_nid = _method_on_type_or_bases(owner_nid, key(step))
+        returned = node_by_id.get(method_nid or "", {}).get("_kotlin_ret")
+        return (returned, _source_of(method_nid)) if returned and method_nid else (None, near)
+
+    def _extension_function(callee_key: str, rc: dict) -> str | None:
+        if callee_key in _KOTLIN_NO_EXTENSION_FALLBACK:
+            return None
+        candidates = toplevel_functions.get(callee_key, [])
+        if len(candidates) <= 1:
+            return candidates[0] if candidates else None
+        sf = str(rc.get("source_file", ""))
+        imported = imported_by_file.get(file_nids.get(sf, ""), set())
+        via_import = [c for c in candidates if c in imported]
+        if len(via_import) == 1:
+            return via_import[0]
+        same_dir = [c for c in candidates if os.path.dirname(_source_of(c)) == os.path.dirname(sf)]
+        return same_dir[0] if len(same_dir) == 1 else None
+
+    flow_reads: list[tuple[str, str]] = []
     for rc in raw:
-        receiver, callee, caller = rc["receiver"], rc["callee"], rc["caller_nid"]
-        type_name = rc.get("receiver_type")
-        if not type_name:
-            owner = enclosing_type.get(caller, caller)
-            type_name = _inherited_field_type(owner, receiver)
-        if not type_name or type_name in _LANGUAGE_BUILTIN_GLOBALS:
+        callee, caller = rc["callee"], rc["caller_nid"]
+        chain = rc.get("kotlin_receiver_chain")
+        near = str(rc.get("source_file", ""))
+        if chain:
+            flow_reads.clear()
+            type_name, near = _chain_type(chain, caller, near)
+            for reader, prop_nid in flow_reads:
+                if reader != prop_nid and (reader, prop_nid) not in existing_pairs:
+                    existing_pairs.add((reader, prop_nid))
+                    all_edges.append({
+                        "source": reader,
+                        "target": prop_nid,
+                        "relation": "calls",
+                        "context": "property_read",
+                        "confidence": "INFERRED",
+                        "confidence_score": 0.85,
+                        "source_file": rc.get("source_file", ""),
+                        "source_location": rc.get("source_location"),
+                        "weight": 1.0,
+                    })
+        else:
+            type_name = rc.get("receiver_type") or _inherited_field_type(
+                enclosing_type.get(caller, caller), rc["receiver"]
+            )
+        if not type_name or "<" in type_name or type_name in _LANGUAGE_BUILTIN_GLOBALS:
             continue
-        type_nid, declared = _type_named(type_name, rc)
+        type_nid, declared = _type_named(type_name, {"source_file": near})
         if type_nid is None:
-            if not declared:
+            if not declared and not chain:
                 _park_unresolved_member_call(node_by_id.get(caller), callee, type_name, "kotlin", rc)
             continue
         method_nid = _method_on_type_or_bases(type_nid, key(callee))
+        score = 0.85
+        if not method_nid:
+            method_nid = _extension_function(key(callee), rc)
+            score = 0.75
         if not method_nid or method_nid == caller or (caller, method_nid) in existing_pairs:
             continue
         existing_pairs.add((caller, method_nid))
@@ -8384,7 +8561,7 @@ def _resolve_kotlin_receiver_member_calls(
             "relation": "calls",
             "context": "call",
             "confidence": "INFERRED",
-            "confidence_score": 0.85,
+            "confidence_score": score,
             "source_file": rc.get("source_file", ""),
             "source_location": rc.get("source_location"),
             "weight": 1.0,

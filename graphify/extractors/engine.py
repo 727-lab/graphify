@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import re
 from graphify.extractors.base import (
     _LANGUAGE_BUILTIN_GLOBALS,
     _file_stem,
@@ -1361,7 +1362,7 @@ def _kotlin_method_receiver_types(
                  if s.type in ("user_type", "nullable_type", "type_reference", "parenthesized_type")),
                 None,
             )
-            bind(name, _kotlin_declared_type_name(type_node, source))
+            bind(name, _kotlin_declared_type_ref(type_node, source))
 
     body = next((c for c in method_node.children if c.type == "function_body"), None)
     stack = list(body.children) if body is not None else []
@@ -1376,7 +1377,7 @@ def _kotlin_method_receiver_types(
             name = _kotlin_property_name(node, source)
             type_node = _kotlin_property_type_node(node)
             type_name = (
-                _kotlin_declared_type_name(type_node, source) if type_node is not None
+                _kotlin_declared_type_ref(type_node, source) if type_node is not None
                 else _kotlin_constructor_init_type(node, source)
             )
             if name and type_name:
@@ -1407,6 +1408,195 @@ def _kotlin_this_field_receiver(nav, source: bytes) -> str | None:
             or inner[1].type not in ("simple_identifier", "identifier")):
         return None
     return _read_text(inner[1], source)
+
+
+_KOTLIN_DI_WRAPPERS = frozenset({"Lazy", "Provider", "StateFlow", "MutableStateFlow"})
+
+_KOTLIN_SUSPEND_LAMBDA = re.compile(rb"\bsuspend(\s*\{)")
+_KOTLIN_SOFT_KEYWORD_PARAM = re.compile(rb"\boverride(?=\s*(?:,|->|\)|\?\.|\.|\?:))")
+_KOTLIN_TRAILING_TYPE_COMMA = re.compile(rb",(\s*>)")
+
+
+def _kotlin_repair_grammar_gaps(source: bytes) -> bytes:
+    repaired = _KOTLIN_SUSPEND_LAMBDA.sub(lambda m: b"run    " + m.group(1), source)
+    repaired = _KOTLIN_TRAILING_TYPE_COMMA.sub(lambda m: b" " + m.group(1), repaired)
+    return _KOTLIN_SOFT_KEYWORD_PARAM.sub(b"overrid_", repaired)
+
+
+def _kotlin_flow_extension_property(property_node, source: bytes) -> tuple[str, str, list[str]] | None:
+    children = property_node.children
+    dot = next((i for i, c in enumerate(children) if c.type == "."), None)
+    if dot is None or dot == 0:
+        return None
+    receiver = _kotlin_declared_type_name(children[dot - 1], source)
+    name = _kotlin_property_name(property_node, source)
+    declaration = next((c for c in children if c.type == "variable_declaration"), None)
+    type_node = next(
+        (c for c in (declaration.children if declaration is not None else [])
+         if c.type in ("user_type", "nullable_type", "type_reference")),
+        None,
+    )
+    type_ref = _kotlin_declared_type_ref(type_node, source)
+    if not receiver or not name or not type_ref or type_ref.partition("<")[0] not in _KOTLIN_FLOW_TYPES:
+        return None
+    reads: list[str] = []
+    getter = next((c for c in children if c.type == "getter"), None)
+    stack = [getter] if getter is not None else []
+    while stack:
+        node = stack.pop()
+        if node.type == "navigation_expression":
+            head = next((c for c in node.children if c.is_named), None)
+            if head is not None and head.type in ("simple_identifier", "identifier"):
+                text = _read_text(head, source)
+                if text not in reads:
+                    reads.append(text)
+        stack.extend(node.children)
+    return name, receiver, reads
+
+
+def _kotlin_type_parameter_bounds(class_node, source: bytes) -> dict[str, str]:
+    bounds: dict[str, str] = {}
+    for c in class_node.children:
+        if c.type == "type_parameters":
+            entries = [p for p in c.children if p.type == "type_parameter"]
+        elif c.type == "type_constraints":
+            entries = [p for p in c.children if p.type == "type_constraint"]
+        else:
+            continue
+        for entry in entries:
+            name_node = next((s for s in entry.children if s.type in ("simple_identifier", "identifier")), None)
+            bound_node = next((s for s in entry.children if s.type in ("user_type", "nullable_type")), None)
+            bound = _kotlin_declared_type_ref(bound_node, source) if bound_node is not None else None
+            if name_node is not None and bound:
+                bounds.setdefault(_read_text(name_node, source), bound)
+    return bounds
+
+
+def _kotlin_substitute_bounds(table: dict[str, str], bounds: dict[str, str]) -> dict[str, str]:
+    if not bounds:
+        return table
+    return {name: bounds.get(type_name, type_name) for name, type_name in table.items()}
+
+
+def _count_error_nodes(root) -> int:
+    count = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "ERROR" or node.is_missing:
+            count += 1
+        stack.extend(node.children)
+    return count
+
+
+_KOTLIN_FLOW_TYPES = frozenset({
+    "Flow", "StateFlow", "SharedFlow", "MutableStateFlow", "MutableSharedFlow",
+    "LiveData", "MutableLiveData",
+})
+
+
+def _kotlin_declared_type_ref(type_node, source: bytes) -> str | None:
+    base = _kotlin_declared_type_name(type_node, source)
+    if base not in _KOTLIN_DI_WRAPPERS:
+        return base
+    node = type_node
+    while node is not None and node.type in ("nullable_type", "parenthesized_type", "type_reference"):
+        node = next((c for c in node.children if c.is_named), None)
+    args = next((c for c in node.children if c.type == "type_arguments"), None) if node is not None else None
+    projections = [c for c in args.children if c.type == "type_projection"] if args is not None else []
+    if len(projections) != 1:
+        return None
+    inner = next((c for c in projections[0].children if c.is_named), None)
+    inner_name = _kotlin_declared_type_name(inner, source)
+    return f"{base}<{inner_name}>" if inner_name else None
+
+
+_KOTLIN_IT_SCOPE_FUNCTIONS = frozenset({"let", "also", "takeIf", "takeUnless"})
+
+
+def _kotlin_lambda_bound_receiver(node, name: str, source: bytes):
+    current = node.parent
+    while current is not None and current.type not in (
+        "function_declaration", "class_declaration", "object_declaration", "source_file",
+    ):
+        if current.type == "lambda_literal":
+            params_node = next((c for c in current.children if c.type == "lambda_parameters"), None)
+            params = [
+                _read_text(i, source)
+                for v in (params_node.children if params_node is not None else [])
+                if v.type == "variable_declaration"
+                for i in v.children if i.type in ("simple_identifier", "identifier")
+            ]
+            binds = name in params if params else name == "it"
+            if binds:
+                holder = current.parent
+                call = holder.parent if holder is not None and holder.type == "annotated_lambda" else None
+                head = call.children[0] if call is not None and call.children else None
+                if head is None or head.type != "navigation_expression" or len(params) > 1:
+                    return True, None
+                parts = [c for c in head.children if c.is_named]
+                if (len(parts) == 2 and parts[1].type in ("simple_identifier", "identifier")
+                        and _read_text(parts[1], source) in _KOTLIN_IT_SCOPE_FUNCTIONS):
+                    return True, parts[0]
+                return True, None
+        current = current.parent
+    return False, None
+
+
+def _kotlin_receiver_chain(node, source: bytes, depth: int = 0) -> list | None:
+    if node is None or depth > 16:
+        return None
+    t = node.type
+    named = [c for c in node.children if c.is_named and c.type != "comment"]
+    if t in ("simple_identifier", "identifier"):
+        name = _read_text(node, source)
+        bound, receiver = _kotlin_lambda_bound_receiver(node, name, source)
+        if bound:
+            return _kotlin_receiver_chain(receiver, source, depth + 1) if receiver is not None else None
+        return ["name", name]
+    if t == "this_expression":
+        return ["this"]
+    if t == "parenthesized_expression":
+        return _kotlin_receiver_chain(named[0], source, depth + 1) if len(named) == 1 else None
+    if t in ("unary_expression", "postfix_expression"):
+        if len(named) == 1 and any(c.type == "!!" for c in node.children):
+            return _kotlin_receiver_chain(named[0], source, depth + 1)
+        return None
+    if t == "as_expression":
+        name = _kotlin_declared_type_name(named[-1], source) if len(named) == 2 else None
+        return ["type", name] if name else None
+    if t == "navigation_expression":
+        if len(named) != 2 or named[1].type not in ("simple_identifier", "identifier"):
+            return None
+        inner = _kotlin_receiver_chain(named[0], source, depth + 1)
+        return ["field", _read_text(named[1], source), inner] if inner else None
+    if t == "call_expression" and node.children:
+        head = node.children[0]
+        if head.type in ("simple_identifier", "identifier"):
+            name = _read_text(head, source)
+            return ["type", name] if name[:1].isupper() else ["call", name, None]
+        if head.type == "navigation_expression":
+            parts = [c for c in head.children if c.is_named]
+            if len(parts) != 2 or parts[1].type not in ("simple_identifier", "identifier"):
+                return None
+            inner = _kotlin_receiver_chain(parts[0], source, depth + 1)
+            return ["call", _read_text(parts[1], source), inner] if inner else None
+    return None
+
+
+def _kotlin_type_chain_leaf(chain: list, receiver_types: dict) -> list | None:
+    kind = chain[0]
+    if kind in ("call", "field"):
+        if chain[2] is None:
+            return chain
+        inner = _kotlin_type_chain_leaf(chain[2], receiver_types)
+        return [kind, chain[1], inner] if inner else None
+    if kind == "name":
+        declared = receiver_types.get(chain[1])
+        if declared:
+            return ["type", declared]
+        return ["type", chain[1]] if chain[1][:1].isupper() else None
+    return chain
 
 
 def _kotlin_property_type_node(property_node):
@@ -6550,6 +6740,12 @@ def _extract_generic(
             source = source + b"\n"
         tree = parser.parse(source)
         root = tree.root_node
+        if config.ts_module == "tree_sitter_kotlin" and root.has_error:
+            repaired = _kotlin_repair_grammar_gaps(source)
+            if repaired != source:
+                repaired_tree = parser.parse(repaired)
+                if _count_error_nodes(repaired_tree.root_node) < _count_error_nodes(root):
+                    source, tree, root = repaired, repaired_tree, repaired_tree.root_node
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
@@ -6669,7 +6865,11 @@ def _extract_generic(
     # an injected dependency (`repo.save()`) had no receiver type and the shared
     # cross-file pass dropped it as an unresolvable member call.
     kotlin_field_types: dict[str, dict[str, str]] = {}
-    kotlin_method_scopes: dict[int, tuple[object, str]] = {}
+    kotlin_method_scopes: dict[int, tuple[object, str | None]] = {}
+    kotlin_return_types: dict[str, str] = {}
+    kotlin_bodyless_classes: dict[int, str] = {}
+    kotlin_type_bounds: dict[str, dict[str, str]] = {}
+    kotlin_constructor_params: dict[str, dict[str, str]] = {}
     # C# receiver typing is method-scoped too (#2299): class fields/properties
     # are shared, parameters and locals belong only to their declaring method —
     # the old file-wide table let one method's untypable rebinding poison a
@@ -7243,6 +7443,18 @@ def _extract_generic(
                                             has_val_var = True
                                             break
                                     if not has_val_var:
+                                        _plain_name = next(
+                                            (_read_text(sub, source) for sub in cp.children
+                                             if sub.type in ("simple_identifier", "identifier")),
+                                            None,
+                                        )
+                                        _plain_type = _kotlin_declared_type_ref(next(
+                                            (sub for sub in cp.children
+                                             if sub.type in ("user_type", "nullable_type", "type_reference")),
+                                            None,
+                                        ), source)
+                                        if _plain_name and _plain_type:
+                                            kotlin_constructor_params.setdefault(class_nid, {})[_plain_name] = _plain_type
                                         continue
                                     ptype = None
                                     for sub in cp.children:
@@ -7256,7 +7468,7 @@ def _extract_generic(
                                              if sub.type in ("simple_identifier", "identifier")),
                                             None,
                                         )
-                                        _cp_type = _kotlin_declared_type_name(ptype, source)
+                                        _cp_type = _kotlin_declared_type_ref(ptype, source)
                                         if _cp_name and _cp_type:
                                             kotlin_field_types.setdefault(class_nid, {})[_cp_name] = _cp_type
                                         refs: list[tuple[str, str]] = []
@@ -7758,6 +7970,10 @@ def _extract_generic(
             # Find body and recurse. Ruby pushes its scope segments so nested
             # declarations qualify against the enclosing module/class (#2302);
             # ruby_segments is empty for every other language.
+            if config.ts_module == "tree_sitter_kotlin":
+                _kt_bounds = _kotlin_type_parameter_bounds(node, source)
+                if _kt_bounds:
+                    kotlin_type_bounds[class_nid] = _kt_bounds
             body = _find_body(node, config)
             if body:
                 ruby_namespace.extend(ruby_segments)
@@ -7775,6 +7991,8 @@ def _extract_generic(
                         ruby_lexical_scopes.pop()
                     if ruby_segments:
                         del ruby_namespace[-len(ruby_segments):]
+            elif config.ts_module == "tree_sitter_kotlin":
+                kotlin_bodyless_classes[id(node)] = class_nid
             return
 
         # Event listener property arrays: $listen = [Event::class => [Listener::class]]
@@ -8074,11 +8292,17 @@ def _extract_generic(
                 type_node = _kotlin_property_type_node(node)
                 _prop_name = _kotlin_property_name(node, source)
                 _prop_type = (
-                    _kotlin_declared_type_name(type_node, source) if type_node is not None
+                    _kotlin_declared_type_ref(type_node, source) if type_node is not None
                     else _kotlin_constructor_init_type(node, source)
                 )
                 if _prop_name and _prop_type:
                     kotlin_field_types.setdefault(parent_class_nid, {})[_prop_name] = _prop_type
+                    if _prop_type.partition("<")[0] in _KOTLIN_FLOW_TYPES:
+                        _prop_nid = _make_id(parent_class_nid, _prop_name)
+                        if _prop_nid not in seen_ids:
+                            add_node(_prop_nid, f".{_prop_name}", line,
+                                     metadata={"kotlin_flow_property": True})
+                            add_edge(parent_class_nid, _prop_nid, "method", line)
                 if type_node is not None:
                     refs: list[tuple[str, str]] = []
                     _kotlin_collect_type_refs(type_node, source, False, refs)
@@ -8098,6 +8322,19 @@ def _extract_generic(
                     if target_nid != parent_class_nid and target_nid not in annotation_targets:
                         add_edge(parent_class_nid, target_nid, "references", line, context="attribute")
                         annotation_targets.add(target_nid)
+            else:
+                _ext = _kotlin_flow_extension_property(node, source)
+                if _ext is not None:
+                    _ext_name, _ext_receiver, _ext_reads = _ext
+                    _ext_nid = _make_id(stem, _ext_receiver, _ext_name)
+                    if _ext_nid not in seen_ids:
+                        _ext_line = node.start_point[0] + 1
+                        add_node(_ext_nid, _ext_name, _ext_line, metadata={
+                            "kotlin_flow_property": True,
+                            "kotlin_extension_receiver": _ext_receiver,
+                            "kotlin_getter_reads": _ext_reads,
+                        })
+                        add_edge(file_nid, _ext_nid, "contains", _ext_line)
             # #2565: seed the initializer into initializer_nodes so walk_calls
             # collects its calls (`val repo = createRepo()`), which previously
             # died at the `return` below. Seeding the WHOLE expression (not just
@@ -8703,6 +8940,11 @@ def _extract_generic(
                             if target_nid != func_nid:
                                 add_edge(func_nid, target_nid, "references", line, context=ctx)
                 return_type_node = _kotlin_function_return_type_node(node)
+                if return_type_node is not None and parent_class_nid:
+                    _kt_ret = _kotlin_declared_type_ref(return_type_node, source) or ""
+                    kotlin_return_types[func_nid] = (
+                        _kt_ret if kotlin_return_types.get(func_nid, _kt_ret) == _kt_ret else ""
+                    )
                 if return_type_node is not None:
                     refs = []
                     _kotlin_collect_type_refs(return_type_node, source, False, refs)
@@ -8906,7 +9148,7 @@ def _extract_generic(
                     java_method_scopes[id(body)] = (node, parent_class_nid)
                 if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                     csharp_method_scopes[id(body)] = (node, parent_class_nid)
-                if config.ts_module == "tree_sitter_kotlin" and parent_class_nid:
+                if config.ts_module == "tree_sitter_kotlin":
                     kotlin_method_scopes[id(body)] = (node, parent_class_nid)
                 function_bodies.append((func_nid, body))
                 if config.ts_module in (
@@ -9270,6 +9512,19 @@ def _extract_generic(
                 walk(child, parent_class_nid=parent_class_nid)
             return
 
+        if config.ts_module == "tree_sitter_kotlin" and t == "source_file":
+            pending_class: str | None = None
+            for child in node.children:
+                if child.type == "ERROR" and pending_class:
+                    walk(child, parent_class_nid=pending_class)
+                    continue
+                walk(child, parent_class_nid=None)
+                if child.type in ("class_declaration", "object_declaration"):
+                    pending_class = kotlin_bodyless_classes.get(id(child))
+                elif child.type == "function_declaration":
+                    pending_class = None
+            return
+
         # Default: recurse
         for child in node.children:
             walk(child, parent_class_nid=None)
@@ -9468,11 +9723,17 @@ def _extract_generic(
         )
         for body_id, (method_node, class_nid) in csharp_method_scopes.items()
     }
+    for _kt_class, _kt_bounds in kotlin_type_bounds.items():
+        if _kt_class in kotlin_field_types:
+            kotlin_field_types[_kt_class] = _kotlin_substitute_bounds(kotlin_field_types[_kt_class], _kt_bounds)
     kotlin_receiver_types = {
-        body_id: _kotlin_method_receiver_types(
-            method_node,
-            source,
-            _fields_up_chain(kotlin_field_types, class_nid),
+        body_id: _kotlin_substitute_bounds(
+            _kotlin_method_receiver_types(
+                method_node,
+                source,
+                _fields_up_chain(kotlin_field_types, class_nid),
+            ),
+            kotlin_type_bounds.get(class_nid or "", {}),
         )
         for body_id, (method_node, class_nid) in kotlin_method_scopes.items()
     }
@@ -9782,6 +10043,7 @@ def _extract_generic(
             csharp_qualified_prefix: str | None = None
             csharp_receiver_chain: list[str] | None = None
             java_receiver_chain: list | None = None
+            kotlin_receiver_chain: list | None = None
             lua_self_qualified: bool = False  # Lua self:m() rewritten to Table:m
 
             # Special handling per language
@@ -9849,7 +10111,23 @@ def _extract_generic(
                         # receiver would trip the capitalized-receiver deferral
                         # below and regress in-file `Foo.bar()` resolution.
                         segments = _kotlin_nav_identifier_segments(first, source)
-                        if segments is not None and len(segments) >= 3:
+                        _kt_bound = receiver_types if isinstance(receiver_types, dict) else {}
+                        _kt_parts = [c for c in first.children if c.is_named]
+                        _kt_lambda_bound = False
+                        if segments is not None and segments[0][:1].islower() and len(_kt_parts) == 2:
+                            _kt_leftmost = _kt_parts[0]
+                            while _kt_leftmost.type == "navigation_expression" and _kt_leftmost.named_children:
+                                _kt_leftmost = _kt_leftmost.named_children[0]
+                            _kt_lambda_bound, _ = _kotlin_lambda_bound_receiver(_kt_leftmost, segments[0], source)
+                        _kt_value_chain = segments is not None and (
+                            _kt_lambda_bound or (len(segments) >= 3 and segments[0] in _kt_bound)
+                        )
+                        if _kt_value_chain or (segments is None and not _kotlin_this_field_receiver(first, source)):
+                            if len(_kt_parts) == 2:
+                                _kt_chain = _kotlin_receiver_chain(_kt_parts[0], source)
+                                if _kt_chain and (_kt_lambda_bound or _kt_chain[0] in ("call", "field")):
+                                    kotlin_receiver_chain = _kotlin_type_chain_leaf(_kt_chain, _kt_bound)
+                        if segments is not None and len(segments) >= 3 and not _kt_value_chain:
                             kotlin_qualified_prefix = ".".join(segments[:-1])
                         # #1698: the plain `Receiver.method()` shape (exactly
                         # two segments) is neither a fully qualified name nor
@@ -9874,7 +10152,7 @@ def _extract_generic(
                         # function's type table; the in-file bare-name lookup
                         # below is unchanged (a lowercase receiver never trips
                         # the capitalized-receiver deferral).
-                        elif segments is not None and len(segments) == 2:
+                        elif segments is not None and len(segments) == 2 and not _kt_lambda_bound:
                             member_receiver = segments[0]
                         elif segments is None:
                             # `this.field.method()`: the field is the receiver.
@@ -10757,6 +11035,9 @@ def _extract_generic(
                                 _kt_type = receiver_types.get(member_receiver)
                                 if _kt_type:
                                     rc_entry["receiver_type"] = _kt_type
+                        if config.ts_module == "tree_sitter_kotlin" and is_member_call and kotlin_receiver_chain:
+                            rc_entry["lang"] = "kotlin"
+                            rc_entry["kotlin_receiver_chain"] = kotlin_receiver_chain
                         raw_calls.append(rc_entry)
 
             # Indirect dispatch: a function passed BY NAME as a call argument
@@ -11124,7 +11405,13 @@ def _extract_generic(
     # self-guards against re-entering function bodies and dedups via
     # seen_call_pairs, so a closure inside an initializer is not double-walked.
     for owner_nid, init_node in initializer_nodes:
-        walk_calls(init_node, owner_nid)
+        if config.ts_module == "tree_sitter_kotlin":
+            walk_calls(init_node, owner_nid, _kotlin_substitute_bounds(
+                {**_fields_up_chain(kotlin_field_types, owner_nid), **kotlin_constructor_params.get(owner_nid, {})},
+                kotlin_type_bounds.get(owner_nid, {}),
+            ))
+        else:
+            walk_calls(init_node, owner_nid)
 
     # ── Event listener pass ───────────────────────────────────────────────────
     seen_listen_pairs: set[tuple[str, str]] = set()
@@ -11260,6 +11547,8 @@ def _extract_generic(
     for _n in nodes:
         if java_return_types.get(_n["id"]):
             _n["_java_ret"] = java_return_types[_n["id"]]
+        if kotlin_return_types.get(_n["id"]):
+            _n["_kotlin_ret"] = kotlin_return_types[_n["id"]]
     # #2551: the parser recovered from syntax errors, so extraction may be
     # partial (in the worst case, nothing but the file node). Record the first
     # error's line so extract() can warn instead of reporting silent success.
