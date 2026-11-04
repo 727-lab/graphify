@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -283,6 +284,38 @@ def resolve_seed(graph: nx.Graph, query: str, root: Path | None = None) -> str |
     ]
     if len(contains_matches) == 1:
         return contains_matches[0]
+    return _resolve_member_through_supertypes(graph, query)
+
+
+_TYPE_MEMBER_RE = re.compile(r"^([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)(?:\(\))?$")
+
+
+def _resolve_member_through_supertypes(graph: nx.Graph, query: str) -> str | None:
+    """`Type.member` where `member` is declared on a supertype of `Type`.
+
+    A Kotlin interface that extends another one inherits its methods without
+    redeclaring them, so `CheckoutInteractorB2B.selectPayType` has no node of
+    its own. The nearest supertype that declares the member answers for it.
+    """
+    match = _TYPE_MEMBER_RE.match(query.strip())
+    if match is None or not isinstance(graph, nx.DiGraph):
+        return None
+    type_name, member = match.groups()
+    member_label = f".{member}()"
+    types = [str(n) for n, d in graph.nodes(data=True) if d.get("label") == type_name]
+    if len(types) != 1:
+        return None
+    cache: dict[str, list[str]] = {}
+    for owner in [types[0], *_supertypes(graph, types[0], cache)]:
+        hits = [
+            str(target)
+            for _s, target, data in graph.out_edges(owner, data=True)
+            if data.get("relation") == "method" and graph.nodes[target].get("label") == member_label
+        ]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            return None
     return None
 
 

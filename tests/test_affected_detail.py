@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import networkx as nx
 
-from graphify.affected import format_affected
+from graphify.affected import format_affected, resolve_seed
 
 
 def _graph(tmp_path):
@@ -33,3 +33,17 @@ def test_detail_adds_the_owner_class_and_the_call_line(tmp_path, monkeypatch):
     monkeypatch.setenv("GRAPHIFY_AFFECTED_DETAIL", "1")
     out = format_affected(_graph(tmp_path), ".save()", depth=1, root=tmp_path, seed="repo_save")
     assert "- Service.run() [calls] app/Service.kt:L3  | repo.save(\"1\")" in out
+
+
+def test_type_member_resolves_through_the_supertype_that_declares_it():
+    graph = nx.DiGraph()
+    graph.add_node("base", label="PayTypes", source_file="lib/PayTypes.kt")
+    graph.add_node("base_select", label=".select()", source_file="lib/PayTypes.kt")
+    graph.add_node("b2b", label="InteractorB2B", source_file="app/InteractorB2B.kt")
+    graph.add_node("other", label="Unrelated", source_file="app/Unrelated.kt")
+    graph.add_node("other_select", label=".select()", source_file="app/Unrelated.kt")
+    graph.add_edge("base", "base_select", relation="method")
+    graph.add_edge("other", "other_select", relation="method")
+    graph.add_edge("b2b", "base", relation="inherits")
+    assert resolve_seed(graph, "InteractorB2B.select") == "base_select"
+    assert resolve_seed(graph, "InteractorB2B.missing") is None
